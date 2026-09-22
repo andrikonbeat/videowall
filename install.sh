@@ -2,7 +2,7 @@
 # videowall installer — idempotent. Safe to re-run.
 #
 # Installs:
-#   ~/.local/share/videowall/            launcher + autopause daemon
+#   ~/.local/share/videowall/            launcher, autopause daemon + picker
 #   ~/.config/videowall/videowall.conf   config template (only if missing)
 #   ~/.local/state/videowall-installed   installed marker
 # plus an idempotent autostart entry for the detected Hyprland variant.
@@ -50,7 +50,10 @@ fi
 mkdir -p "$INSTALL_DIR"
 install -m 755 "$REPO_DIR/src/videowall" "$INSTALL_DIR/videowall"
 install -m 755 "$REPO_DIR/src/videowall-autopause" "$INSTALL_DIR/videowall-autopause"
+install -m 755 "$REPO_DIR/src/videowall-picker" "$INSTALL_DIR/videowall-picker"
 say "installed scripts -> $INSTALL_DIR/"
+command -v fzf >/dev/null 2>&1 \
+    || say "note: fzf not found - install it to use videowall-picker (sudo pacman -S fzf)"
 
 # --- 4. Config template (never overwrite user edits) --------------------------
 mkdir -p "$CONFIG_DIR"

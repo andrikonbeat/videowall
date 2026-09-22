@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# videowall-picker — fzf-based wallpaper video picker for videowall.
+#
+# Scans $HOME/.local/share/wallpapers/ (plus the optional WALLPAPER_DIR= from
+# the config) for *.mp4|*.webm|*.mov|*.mkv and shows one row per video with
+# size / resolution / duration. Preview: a real frame rendered with chafa when
+# available (metadata pane otherwise). Enter applies live: pkill mpvpaper,
+# persist VIDEO= in the config, relaunch the videowall launcher.
+#
+# Modes:
+#   videowall-picker                 interactive picker (Enter = apply)
+#   videowall-picker --list          print the rendered rows, no fzf
+#   videowall-picker --dry-run [FILE]  print what applying FILE would execute;
+#                                   with no FILE, pick interactively and dry-run
+#   videowall-picker --preview-frame FILE [MID]  internal: fzf preview renderer
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/videowall/videowall.conf"
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+DEFAULT_DIR="$HOME/.local/share/wallpapers"
+CACHE_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/videowall/probe-cache.json"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/videowall-picker.log"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+note() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
+
+# --- Video discovery (dedupe by basename) -----------------------------------
+declare -a VIDEOS
+scan_videos() {
+    local d b
+    declare -A seen=()
+    for d in "$DEFAULT_DIR" "${WALLPAPER_DIR:-}"; do
+        [ -z "$d" ] || [ -d "$d" ] || continue
+        while IFS= read -r -d '' f; do
+            b="$(basename "$f")"
+            if [ -z "${seen[$b]:-}" ]; then
+                seen[$b]=1
+                VIDEOS+=("$f")
+            fi
+        done < <(find "$d" -maxdepth 1 -type f \
+            \( -iname '*.mp4' -o -iname '*.webm' -o -iname '*.mov' -o -iname '*.mkv' \) \
+            -print0 2>/dev/null)
+    done
+}
+
+# --- ffprobe metadata cache (JSON, one object per line) ----------------------
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+cache_line() { # $1 path -> cached JSON line (empty if absent)
+    local p; p="$(json_escape "$1")"
+    grep -F -- "\"path\":\"$p\"" "$CACHE_FILE" 2>/dev/null | tail -n 1
+}
+
+meta() { # $1 path -> "width height dur" (0 = unknown)
+    local line w h dur
+    line="$(cache_line "$1")"
+    w="$(printf '%s' "$line" | sed -n 's/.*"width":\([0-9]*\).*/\1/p')"
+    h="$(printf '%s' "$line" | sed -n 's/.*"height":\([0-9]*\).*/\1/p')"
+    dur="$(printf '%s' "$line" | sed -n 's/.*"dur":\([0-9.]*\).*/\1/p')"
+    printf '%s %s %s\n' "${w:-0}" "${h:-0}" "${dur:-0}"
+}
+
+probe_video() { # $1 path $2 mtime $3 size -> JSON object line
+    local p w h dur out
+    p="$(json_escape "$1")"; w=0; h=0; dur=0
+    if command -v ffprobe >/dev/null 2>&1; then
+        out="$(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height:format=duration \
+            -of default=noprint_wrappers=1 "$1" 2>/dev/null)"
+        w="$(printf '%s\n' "$out" | sed -n 's/^width=//p' | head -n1)"
+        h="$(printf '%s\n' "$out" | sed -n 's/^height=//p' | head -n1)"
+        dur="$(printf '%s\n' "$out" | sed -n 's/^duration=//p' | head -n1)"
+        case "$dur" in *[!0-9.]*) dur=0 ;; esac
+        w="${w:-0}"; h="${h:-0}"; dur="${dur:-0}"
+    fi
+    printf '{"path":"%s","mtime":%s,"size":%s,"width":%s,"height":%s,"dur":%s}\n' \
+        "$p" "$2" "$3" "$w" "$h" "$dur"
+}
+
+build_cache() { # re-probe only files whose mtime/size changed; prune the rest
+    mkdir -p "$(dirname "$CACHE_FILE")"
+    local tmp="$CACHE_FILE.tmp.$$" f line mtime size sm ss
+    : > "$tmp"
+    for f in "${VIDEOS[@]}"; do
+        mtime="$(stat -c '%Y' "$f" 2>/dev/null || printf 0)"
+        size="$(stat -c '%s' "$f" 2>/dev/null || printf 0)"
+        line="$(cache_line "$f")"
+        sm="$(printf '%s' "$line" | sed -n 's/.*"mtime":\([0-9]*\).*/\1/p')"
+        ss="$(printf '%s' "$line" | sed -n 's/.*"size":\([0-9]*\).*/\1/p')"
+        if [ -n "$line" ] && [ "$sm" = "$mtime" ] && [ "$ss" = "$size" ]; then
+            printf '%s\n' "$line" >> "$tmp"
+        else
+            probe_video "$f" "$mtime" "$size" >> "$tmp"
+        fi
+    done
+    mv "$tmp" "$CACHE_FILE"
+}
+
+# --- Formatting helpers -------------------------------------------------------
+human_size() { # bytes -> 10.4M / 1.2G ...
+    awk -v b="$1" 'BEGIN{
+        if (b >= 1073741824) printf "%.1fG", b/1073741824
+        else if (b >= 1048576) printf "%.1fM", b/1048576
+        else if (b >= 1024)    printf "%.1fK", b/1024
+        else                   printf "%dB", b }'
+}
+
+fmt_dur() { # seconds -> HH:MM:SS
+    local s="${1%.*}"; s="${s:-0}"
+    printf '%02d:%02d:%02d' $((s / 3600)) $(((s % 3600) / 60)) $((s % 60))
+}
+
+is_active() { # $1 path: the conf VIDEO or its generated 1080p copy
+    [ -n "${VIDEO:-}" ] && { [ "$1" = "$VIDEO" ] || [ "$1" = "${VIDEO%.*}-1080p.mp4" ]; }
+}
+
+render_rows() { # prints: display<TAB>path<TAB>mid-seek-seconds
+    local f b label max=0
+    for f in "${VIDEOS[@]}"; do
+        b="$(basename "$f")"; label="${b%.*}"
+        [ "${#label}" -gt "$max" ] && max="${#label}"
+    done
+    [ "$max" -gt 40 ] && max=40
+    for f in "${VIDEOS[@]}"; do
+        local w h dur size res mid marker
+        read -r w h dur <<< "$(meta "$f")"
+        b="$(basename "$f")"; label="${b%.*}"
+        [ "${#label}" -gt 40 ] && label="${label:0:37}..."
+        size="$(stat -c %s "$f" 2>/dev/null || printf 0)"
+        if [ "$h" -gt 0 ] 2>/dev/null; then res="${h}p"; else res="?"; fi
+        mid=0; [ -n "$dur" ] && mid=$(( ${dur%.*} / 2 ))
+        marker=" "; is_active "$f" && marker="*"
+        printf '%s %-*s  %5s  %8s  %7s\t%s\t%s\n' \
+            "$marker" "$max" "$label" "$res" "$(fmt_dur "$dur")" \
+            "$(human_size "$size")" "$f" "$mid"
+    done
+}
+
+# --- Preview (fzf calls this per selection; fzf kills it on any change) -------
+metadata_pane() { # $1 path
+    local w h dur size
+    read -r w h dur <<< "$(meta "$1")"
+    size="$(stat -c %s "$1" 2>/dev/null || printf 0)"
+    printf 'videowall — preview (metadata)\n'
+    printf 'name       : %s\n' "$(basename "${1%.*}")"
+    printf 'size       : %s\n' "$(human_size "$size")"
+    if [ "${h:-0}" -gt 0 ] 2>/dev/null; then
+        printf 'resolution : %sx%s\n' "$w" "$h"
+    else
+        printf 'resolution : ?\n'
+    fi
+    printf 'duration   : %s\n' "$(fmt_dur "${dur:-0}")"
+    printf 'path       : %s\n' "$1"
+    command -v chafa >/dev/null 2>&1 \
+        || printf 'hint       : install chafa for frame previews (pacman -S chafa)\n'
+}
+
+preview_frame() { # $1 path $2 mid-seek
+    local path="$1" mid="${2:-0}"
+    local cols="${FZF_PREVIEW_COLUMNS:-}" lines="${FZF_PREVIEW_LINES:-}"
+    if [ -z "$cols" ] || [ -z "$lines" ]; then
+        cols="$(tput cols 2>/dev/null)"; lines="$(tput lines 2>/dev/null)"
+    fi
+    cols="${cols:-80}"; lines="${lines:-24}"
+    if command -v chafa >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1 \
+        && [ -f "$path" ]; then
+        local pid=""
+        ffmpeg -nostdin -v error -ss "$mid" -i "$path" -frames:v 1 \
+            -f image2pipe -c:v png - 2>/dev/null \
+            | chafa -f symbols --size "${cols}x${lines}" - 2>/dev/null &
+        pid=$!
+        trap '[ -n "$pid" ] && kill "$pid" 2>/dev/null; exit 0' TERM INT
+        wait "$pid" && { trap - TERM INT; return 0; }
+        trap - TERM INT
+    fi
+    metadata_pane "$path"
+}
+
+# --- Apply --------------------------------------------------------------------
+LAUNCHER="$(dirname "$SELF")/videowall"
+[ -f "$LAUNCHER" ] || LAUNCHER="${XDG_DATA_HOME:-$HOME/.local/share}/videowall/videowall"
+
+persist_video() { # $1 path -> rewrite VIDEO= in the active conf (never overwrite other keys)
+    local path="$1" esc tmp
+    esc="${path//\\/\\\\}"; esc="${esc//\"/\\\"}"
+    esc="${esc//\$/\\\$}"; esc="${esc//\`/\\\`}"
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    if [ -f "$CONFIG_FILE" ] && grep -q '^[[:space:]]*VIDEO=' "$CONFIG_FILE"; then
+        tmp="$CONFIG_FILE.tmp.$$"
+        NEWVIDEO="VIDEO=\"$esc\"" \
+        awk '/^[[:space:]]*VIDEO=/{ print ENVIRON["NEWVIDEO"]; next } { print }' \
+            "$CONFIG_FILE" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
+    else
+        { [ -f "$CONFIG_FILE" ] && tail -c1 "$CONFIG_FILE" 2>/dev/null | grep -q .; } \
+            && printf '\n' >> "$CONFIG_FILE"
+        printf '# videowall configuration (updated by videowall-picker)\nVIDEO="%s"\n' \
+            "$esc" >> "$CONFIG_FILE"
+    fi
+}
+
+apply() { # $1 path; with --dry-run prints the exact commands instead of running them
+    local path="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'pkill -x mpvpaper\n'
+        printf 'set VIDEO=%q in %s\n' "$path" "$CONFIG_FILE"
+        printf 'nohup bash %q >> %q 2>&1 &\n' "$LAUNCHER" "$LOG"
+        printf '[dry-run] nothing was executed\n'
+        return 0
+    fi
+    persist_video "$path"
+    pkill -x mpvpaper 2>/dev/null
+    nohup bash "$LAUNCHER" >>"$LOG" 2>&1 &
+    printf 'Applied: %s\nRestarted mpvpaper via %s\n' "$path" "$LAUNCHER"
+    note "applied: $path"
+}
+
+usage() {
+    sed -n '2,9p' "$SELF" | sed 's/^# \{0,1\}//'
+    echo
+    printf 'Flags:\n  --list             print rows, no fzf\n  --dry-run [FILE]   print the apply commands, touch nothing\n  --help             this help\n'
+}
+
+# --- Main ---------------------------------------------------------------------
+DRY_RUN=0
+case "${1:-}" in
+    --preview-frame) preview_frame "$2" "${3:-0}"; exit 0 ;;
+    --list)          MODE=list ;;
+    --dry-run)       DRY_RUN=1; MODE=dry; SEL_FILE="${2:-}" ;;
+    --help|-h)       usage; exit 0 ;;
+    *)               MODE=interactive ;;
+esac
+
+scan_videos
+if [ "${#VIDEOS[@]}" -eq 0 ]; then
+    printf 'videowall-picker: no wallpaper videos found.\n' >&2
+    printf '  Scanned: %s' "$DEFAULT_DIR" >&2
+    [ -n "${WALLPAPER_DIR:-}" ] && printf ' + %s' "$WALLPAPER_DIR" >&2
+    printf '\n  Drop *.mp4/*.webm/*.mov/*.mkv files there, or set WALLPAPER_DIR in %s.\n' \
+        "$CONFIG_FILE" >&2
+    exit 1
+fi
+
+build_cache
+
+if [ "$MODE" = "list" ]; then
+    render_rows | sort | cut -f1
+    exit 0
+fi
+
+if [ -n "${SEL_FILE:-}" ]; then
+    [ -f "$SEL_FILE" ] || { printf 'videowall-picker: not a file: %s\n' "$SEL_FILE" >&2; exit 1; }
+    apply "$SEL_FILE"
+    exit 0
+fi
+
+command -v fzf >/dev/null 2>&1 || {
+    printf 'videowall-picker: fzf not found. Install it: sudo pacman -S fzf\n' >&2
+    exit 1
+}
+
+HEADER="videowall — picker
+active: ${VIDEO:-none}
+Enter apply · Esc quit"
+line="$(render_rows | sort | \
+    fzf --no-multi --no-sort --ansi \
+        --delimiter=$'\t' --with-nth=1 \
+        --header="$HEADER" --prompt='wallpaper> ' \
+        --preview="bash $(printf '%q' "$SELF") --preview-frame {2} {3}" \
+        --preview-window='right,60%,border-left' 2>/dev/null)"
+
+[ -n "$line" ] || { printf 'No changes made.\n'; exit 0; }   # Esc / Ctrl+C
+IFS=$'\t' read -r _disp path mid <<< "$line"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    apply "$path"
+    exit 0
+fi
+
+exec </dev/tty   # fzf consumed stdin; re-attach before the confirm prompt
+printf '\nApply "%s" as the wallpaper? [y/N] ' "$(basename "$path")"
+read -r ans
+case "${ans,,}" in
+    y|yes) apply "$path" ;;
+    *)     printf 'No changes made.\n' ;;
+esac
+exit 0

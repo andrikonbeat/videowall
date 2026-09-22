@@ -53,12 +53,57 @@ overwritten afterwards):
 |-----------|--------------|------|
 | `videowall` | `~/.local/share/videowall/videowall` | Launcher: waits for monitors (bounded ~5 s, no blind sleep), generates a local 1080p faststart copy when stale, `pkill -x mpvpaper`, then `exec mpvpaper --loop-file=inf --no-audio --panscan=1.0`. |
 | `videowall-autopause` | `~/.local/share/videowall/videowall-autopause` | Daemon: any socket event → re-check `hyprctl activewindow -j`; fullscreen → SIGSTOP, ended → SIGCONT. Idempotent, reconnects on socket drop, logs to `$XDG_RUNTIME_DIR/videowall-autopause.log`. |
+| `videowall-picker` | `~/.local/share/videowall/videowall-picker` | TUI wallpaper picker: browse videos with size/resolution/duration, preview frames, apply live without restarting (see [Picker](#picker)). |
 | Autostart | variant-dependent | fork: `hl.exec_cmd(...)` blocks inside `hl.on("hyprland.start", ...)` in `execs.lua`; standard: `exec-once =` lines in `hyprland.conf`. |
 
 Why a local 1080p copy? The monitor is 1920x1080, so a 4K source is downscaled
 anyway. The 1080p faststart copy opens in ~0.5 s vs ~0.8 s for 4K on a slow
 mount, is ~10 MB instead of ~185 MB, and decoding it costs ~4x less CPU/GPU.
 The original source is never modified.
+
+## Picker
+
+Switch wallpapers without editing the config or restarting Hyprland:
+
+```bash
+videowall-picker          # interactive
+videowall-picker --list   # just print the scanned videos, no UI
+```
+
+Scans `~/.local/share/wallpapers/` (plus the optional `WALLPAPER_DIR=` from the
+config) for `*.mp4|*.webm|*.mov|*.mkv`, dedupes by basename, and shows one row
+per video with resolution, duration and size. The row of the current `VIDEO=`
+(and of its generated 1080p copy) is marked with `*`.
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Apply: confirm, then `pkill -x mpvpaper`, persist `VIDEO=` in `~/.config/videowall/videowall.conf` and relaunch the launcher — live, no restart. |
+| `Esc` / `Ctrl+C` | Exit without changes. |
+
+Requires **fzf** (`sudo pacman -S fzf`). Run it from a terminal, or bind it in
+Hyprland through a terminal emulator, e.g. `bind = SUPER, V, exec, kitty videowall-picker`.
+
+### Preview
+
+- With **chafa** installed (`sudo pacman -S chafa`), the right pane renders a
+  real frame of the selected video (extracted with ffmpeg at half the
+  duration). The pipeline is killed as soon as the selection changes.
+- **Without chafa** the picker degrades to a metadata pane (name, size,
+  resolution, duration, path) — still fully usable.
+- Metadata (size/resolution/duration) comes from a one-time ffprobe cache at
+  `~/.cache/videowall/probe-cache.json`; only changed files are re-probed, so
+  the list renders instantly even on slow mounts (NTFS/4K).
+
+### Troubleshooting
+
+- **Preview shows only the metadata pane** — chafa is not installed, or the
+  file has no readable video stream. This is the expected fallback; install
+  chafa for frame previews.
+- **First run is slow, later runs are instant** — that is the probe cache
+  warming up. Delete `~/.cache/videowall/probe-cache.json` if you suspect stale
+  entries.
+- **`videowall-picker` says no wallpapers found** — drop videos into
+  `~/.local/share/wallpapers/` or set `WALLPAPER_DIR=` in the config.
 
 ## Uninstall
 
