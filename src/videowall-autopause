@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# videowall-autopause — pauses the video wallpaper while a window is fullscreen.
+#
+# While a fullscreen window (e.g. a game) is active, mpvpaper is SIGSTOPped:
+# the whole process is frozen, so the wallpaper consumes ~0% CPU/GPU.
+# When fullscreen ends, mpvpaper is SIGCONTed.
+#
+# Robust strategy: instead of relying on a "fullscreen>>" event (which the
+# Lua-config fork of Hyprland does not emit), listen to ANY event on the
+# .socket2.sock and re-check the current fullscreen state. This works on
+# standard Hyprland and on the fork; both expose .socket2.sock.
+#
+# STOP/CONT are idempotent: we only STOP if not already stopped (T state)
+# and only CONT if actually stopped.
+
+LOG="${XDG_RUNTIME_DIR:-/tmp}/videowall-autopause.log"
+
+note() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null; }
+
+# Fork JSON uses a space after the colon ("fullscreen": 1); standard may not.
+# [[:space:]]* tolerates both.
+is_fullscreen() {
+    hyprctl activewindow -j 2>/dev/null |
+        grep -q '"fullscreen"[[:space:]]*:[[:space:]]*[1-9]'
+}
+
+command -v socat >/dev/null 2>&1 || { note "ERROR: socat not found"; exit 1; }
+
+if [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+    note "ERROR: HYPRLAND_INSTANCE_SIGNATURE not set (must run inside a Hyprland session)"
+    exit 1
+fi
+SOCK="${XDG_RUNTIME_DIR:-/tmp}/hypr/${HYPRLAND_INSTANCE_SIGNATURE}/.socket2.sock"
+
+# Startup: wait (bounded) for the socket so the daemon survives autostart races.
+for _ in $(seq 1 60); do
+    [ -S "$SOCK" ] && break
+    sleep 0.5
+done
+if [ ! -S "$SOCK" ]; then
+    note "ERROR: socket never appeared: $SOCK"
+    exit 1
+fi
+
+# Which Hyprland variant are we on? Same socket either way; this is for logs.
+VARIANT="standard"
+if hyprctl version 2>/dev/null | grep -q "_hlg_"; then VARIANT="fork"; fi
+note "daemon started (variant: $VARIANT), listening on $SOCK"
+
+# On SIGTERM/SIGINT resume the wallpaper before exiting: otherwise a killed
+# daemon could leave the wallpaper SIGSTOPped (frozen) forever.
+trap 'pkill -CONT -x mpvpaper 2>/dev/null; exit 0' TERM INT
+
+# Initial state: give the launcher a moment to spawn mpvpaper, then check
+# whether something is already fullscreen (e.g. login while a game is up).
+for _ in $(seq 1 5); do
+    pgrep -x mpvpaper >/dev/null 2>&1 && break
+    sleep 1
+done
+if is_fullscreen; then
+    pkill -STOP -x mpvpaper 2>/dev/null && note "initial: wallpaper PAUSED (fullscreen active)"
+fi
+
+# Event loop: any event -> re-check fullscreen state. Reconnect if the socket
+# goes away (Hyprland restart, etc.).
+while true; do
+    socat -u "UNIX-CONNECT:$SOCK" - 2>/dev/null | while IFS= read -r _line; do
+        if is_fullscreen; then
+            # Only STOP if not already paused.
+            if ! ps -o stat= -C mpvpaper 2>/dev/null | grep -q T; then
+                pkill -STOP -x mpvpaper 2>/dev/null && note "wallpaper PAUSED (fullscreen ON)"
+            fi
+        else
+            # Only CONT if actually paused.
+            if ps -o stat= -C mpvpaper 2>/dev/null | grep -q T; then
+                pkill -CONT -x mpvpaper 2>/dev/null && note "wallpaper RESUMED (fullscreen OFF)"
+            fi
+        fi
+    done
+    note "socket closed, retrying in 2s"
+    sleep 2
+done

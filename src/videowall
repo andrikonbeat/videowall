@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# videowall — looping video wallpaper for Hyprland (mpvpaper)
+#
+# Reads ~/.config/videowall/videowall.conf (created by install.sh) if present.
+# Generates a local 1080p faststart copy of the source video when possible:
+#   - The monitor is 1920x1080: a 4K source gets downscaled anyway
+#   - Opens much faster (10MB local vs 185MB on a slow mount)
+#   - Decoding 1080p costs ~4x less CPU/GPU
+# The original source stays untouched.
+#
+# Bounded wait for monitors (no blind sleep), single instance, then exec mpvpaper.
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/videowall/videowall.conf"
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# Defaults (config file may override)
+MONITOR="${MONITOR:-ALL}"
+MPV_OPTS="${MPV_OPTS:-}"
+WALLPAPER_DIR="${WALLPAPER_DIR:-$HOME/.local/share/wallpapers}"
+
+# --- Config validation -------------------------------------------------------
+if [ -z "${VIDEO:-}" ] || [ "$VIDEO" = "/path/to/your/wallpaper.mp4" ]; then
+    echo "videowall: no VIDEO configured." >&2
+    echo "  Edit $CONFIG_FILE and set VIDEO to an absolute path." >&2
+    echo "  Example: VIDEO=\"\$HOME/Videos/wallpaper.mp4\"" >&2
+    exit 1
+fi
+if [ ! -f "$VIDEO" ]; then
+    echo "videowall: video not found: $VIDEO" >&2
+    exit 1
+fi
+
+# --- Optional local 1080p faststart copy -------------------------------------
+# Use the copy when ffmpeg is available and the copy is missing or stale;
+# otherwise play the source as-is.
+PLAY="$VIDEO"
+if command -v ffmpeg >/dev/null 2>&1; then
+    base="$(basename "$VIDEO")"
+    base="${base%.*}"
+    LOCAL="$WALLPAPER_DIR/${base}-1080p.mp4"
+    if [ ! -f "$LOCAL" ] || [ "$LOCAL" -ot "$VIDEO" ]; then
+        echo "videowall: generating 1080p faststart copy -> $LOCAL"
+        mkdir -p "$WALLPAPER_DIR"
+        if ffmpeg -y -v error -i "$VIDEO" \
+            -vf "scale=1920:1080:flags=lanczos" -an \
+            -c:v libx264 -preset veryfast -crf 22 -profile:v high -pix_fmt yuv420p \
+            -movflags +faststart "$LOCAL" 2>/dev/null && [ -s "$LOCAL" ]; then
+            PLAY="$LOCAL"
+        else
+            rm -f "$LOCAL"
+            echo "videowall: conversion failed (ffmpeg error); using original source" >&2
+        fi
+    else
+        PLAY="$LOCAL"
+    fi
+fi
+
+# --- Wait for at least one monitor (bounded ~5s, no blind sleep) --------------
+for _ in $(seq 1 25); do
+    hyprctl monitors -j 2>/dev/null | grep -q '"name"[[:space:]]*:' && break
+    sleep 0.2
+done
+if ! hyprctl monitors -j 2>/dev/null | grep -q '"name"[[:space:]]*:'; then
+    echo "videowall: no monitor detected after 5s (is Hyprland running?)" >&2
+    exit 1
+fi
+
+# --- Single instance + launch -------------------------------------------------
+pkill -x mpvpaper 2>/dev/null
+sleep 0.3
+exec mpvpaper -o "--loop-file=inf --no-audio --mute=yes --no-osc --panscan=1.0${MPV_OPTS:+ }$MPV_OPTS" "$MONITOR" "$PLAY"

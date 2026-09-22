@@ -1,0 +1,9 @@
+# ODD working docs — never commit these
+odd/
+
+# Logs
+*.log
+
+# Local video copies / caches
+*.mp4
+*.webm
